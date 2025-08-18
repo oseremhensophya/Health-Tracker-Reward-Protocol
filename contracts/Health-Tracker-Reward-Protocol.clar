@@ -16,11 +16,14 @@
 (define-constant ERR_STREAK_NOT_FOUND (err u108))
 (define-constant ERR_TEAM_NOT_FOUND (err u109))
 (define-constant ERR_ALREADY_IN_TEAM (err u110))
+(define-constant ERR_MILESTONE_NOT_FOUND (err u111))
+(define-constant ERR_MILESTONE_ALREADY_CLAIMED (err u112))
 
 (define-data-var next-goal-id uint u1)
 (define-data-var next-badge-id uint u1)
 (define-data-var next-team-id uint u1)
 (define-data-var total-fitness-tokens uint u0)
+(define-data-var next-milestone-id uint u1)
 
 (define-map users principal {
     total-steps: uint,
@@ -75,6 +78,21 @@
 
 (define-map leaderboard-weekly principal uint)
 (define-map leaderboard-monthly principal uint)
+
+(define-map milestones uint {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    threshold: uint,
+    reward-amount: uint,
+    milestone-type: (string-ascii 20),
+    is-active: bool
+})
+
+(define-map user-milestones {user: principal, milestone-id: uint} {
+    achieved: bool,
+    claimed: bool,
+    achievement-block: (optional uint)
+})
 
 (define-public (register-user)
     (let ((user tx-sender))
@@ -258,6 +276,65 @@
     )
 )
 
+(define-public (create-milestone (name (string-ascii 50)) (description (string-ascii 200)) (threshold uint) (reward-amount uint) (milestone-type (string-ascii 20)))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (> threshold u0) ERR_INVALID_DATA)
+        (asserts! (> reward-amount u0) ERR_INVALID_DATA)
+        
+        (let ((milestone-id (var-get next-milestone-id)))
+            (map-set milestones milestone-id {
+                name: name,
+                description: description,
+                threshold: threshold,
+                reward-amount: reward-amount,
+                milestone-type: milestone-type,
+                is-active: true
+            })
+            (var-set next-milestone-id (+ milestone-id u1))
+            (ok milestone-id)
+        )
+    )
+)
+
+(define-public (check-and-update-milestones (user principal))
+    (let ((user-data (unwrap! (map-get? users user) ERR_USER_NOT_FOUND)))
+        (begin
+            (unwrap-panic (check-milestone user u1 (get total-steps user-data) "steps"))
+            (unwrap-panic (check-milestone user u2 (get total-rewards user-data) "rewards"))
+            (unwrap-panic (check-milestone user u3 (get best-streak user-data) "streak"))
+            (ok true)
+        )
+    )
+)
+
+(define-public (claim-milestone-reward (milestone-id uint))
+    (let (
+        (user tx-sender)
+        (milestone (unwrap! (map-get? milestones milestone-id) ERR_MILESTONE_NOT_FOUND))
+        (user-milestone (default-to {achieved: false, claimed: false, achievement-block: none}
+                        (map-get? user-milestones {user: user, milestone-id: milestone-id})))
+    )
+        (asserts! (get is-active milestone) ERR_MILESTONE_NOT_FOUND)
+        (asserts! (get achieved user-milestone) ERR_GOAL_NOT_MET)
+        (asserts! (not (get claimed user-milestone)) ERR_MILESTONE_ALREADY_CLAIMED)
+        
+        (map-set user-milestones {user: user, milestone-id: milestone-id}
+            (merge user-milestone {claimed: true}))
+        
+        (try! (ft-mint? fitness-token (get reward-amount milestone) user))
+        (var-set total-fitness-tokens (+ (var-get total-fitness-tokens) (get reward-amount milestone)))
+        
+        (let ((user-data (unwrap! (map-get? users user) ERR_USER_NOT_FOUND)))
+            (map-set users user (merge user-data {
+                total-rewards: (+ (get total-rewards user-data) (get reward-amount milestone))
+            }))
+        )
+        
+        (ok (get reward-amount milestone))
+    )
+)
+
 (define-private (update-streak (user principal))
     (let (
         (current-block stacks-block-height)
@@ -283,6 +360,31 @@
 
 (define-private (update-goal-progress (user principal) (steps uint))
     (ok steps)
+)
+
+(define-private (check-milestone (user principal) (milestone-id uint) (current-value uint) (milestone-type (string-ascii 20)))
+    (match (map-get? milestones milestone-id)
+        milestone
+        (if (and 
+                (is-eq (get milestone-type milestone) milestone-type)
+                (>= current-value (get threshold milestone))
+                (get is-active milestone))
+            (let ((user-milestone (default-to {achieved: false, claimed: false, achievement-block: none}
+                                  (map-get? user-milestones {user: user, milestone-id: milestone-id}))))
+                (if (not (get achieved user-milestone))
+                    (map-set user-milestones {user: user, milestone-id: milestone-id}
+                        (merge user-milestone {
+                            achieved: true,
+                            achievement-block: (some stacks-block-height)
+                        }))
+                    true
+                )
+                (ok true)
+            )
+            (ok false)
+        )
+        (ok false)
+    )
 )
 
 (define-read-only (get-user-stats (user principal))
@@ -319,4 +421,16 @@
 
 (define-read-only (is-oracle-authorized (oracle principal))
     (default-to false (map-get? oracle-providers oracle))
+)
+
+(define-read-only (get-milestone-details (milestone-id uint))
+    (map-get? milestones milestone-id)
+)
+
+(define-read-only (get-user-milestone-progress (user principal) (milestone-id uint))
+    (map-get? user-milestones {user: user, milestone-id: milestone-id})
+)
+
+(define-read-only (get-next-milestone-id)
+    (var-get next-milestone-id)
 )
