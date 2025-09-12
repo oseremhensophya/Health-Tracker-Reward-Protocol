@@ -18,12 +18,19 @@
 (define-constant ERR_ALREADY_IN_TEAM (err u110))
 (define-constant ERR_MILESTONE_NOT_FOUND (err u111))
 (define-constant ERR_MILESTONE_ALREADY_CLAIMED (err u112))
+(define-constant ERR_CHALLENGE_NOT_FOUND (err u113))
+(define-constant ERR_CHALLENGE_INACTIVE (err u114))
+(define-constant ERR_CHALLENGE_ENDED (err u115))
+(define-constant ERR_ALREADY_JOINED_CHALLENGE (err u116))
+(define-constant ERR_CHALLENGE_NOT_JOINED (err u117))
+(define-constant ERR_CHALLENGE_NOT_ENDED (err u118))
 
 (define-data-var next-goal-id uint u1)
 (define-data-var next-badge-id uint u1)
 (define-data-var next-team-id uint u1)
 (define-data-var total-fitness-tokens uint u0)
 (define-data-var next-milestone-id uint u1)
+(define-data-var next-challenge-id uint u1)
 
 (define-map users principal {
     total-steps: uint,
@@ -92,6 +99,36 @@
     achieved: bool,
     claimed: bool,
     achievement-block: (optional uint)
+})
+
+(define-map challenges uint {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    challenge-type: (string-ascii 20),
+    target-value: uint,
+    base-reward: uint,
+    multiplier-rate: uint,
+    start-block: uint,
+    end-block: uint,
+    max-participants: uint,
+    current-participants: uint,
+    is-active: bool,
+    creator: principal
+})
+
+(define-map user-challenges {user: principal, challenge-id: uint} {
+    joined: bool,
+    current-progress: uint,
+    final-score: uint,
+    rank: (optional uint),
+    reward-claimed: bool,
+    join-block: uint
+})
+
+(define-map challenge-leaderboard {challenge-id: uint, rank: uint} {
+    user: principal,
+    score: uint,
+    reward-multiplier: uint
 })
 
 (define-public (register-user)
@@ -335,6 +372,138 @@
     )
 )
 
+(define-public (create-challenge (name (string-ascii 50)) (description (string-ascii 200)) (challenge-type (string-ascii 20)) (target-value uint) (base-reward uint) (multiplier-rate uint) (duration uint) (max-participants uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        (asserts! (> target-value u0) ERR_INVALID_DATA)
+        (asserts! (> base-reward u0) ERR_INVALID_DATA)
+        (asserts! (> multiplier-rate u0) ERR_INVALID_DATA)
+        (asserts! (> duration u0) ERR_INVALID_DATA)
+        (asserts! (> max-participants u0) ERR_INVALID_DATA)
+        
+        (let (
+            (challenge-id (var-get next-challenge-id))
+            (start-block stacks-block-height)
+            (end-block (+ start-block duration))
+        )
+            (map-set challenges challenge-id {
+                name: name,
+                description: description,
+                challenge-type: challenge-type,
+                target-value: target-value,
+                base-reward: base-reward,
+                multiplier-rate: multiplier-rate,
+                start-block: start-block,
+                end-block: end-block,
+                max-participants: max-participants,
+                current-participants: u0,
+                is-active: true,
+                creator: tx-sender
+            })
+            (var-set next-challenge-id (+ challenge-id u1))
+            (ok challenge-id)
+        )
+    )
+)
+
+(define-public (join-challenge (challenge-id uint))
+    (let (
+        (user tx-sender)
+        (challenge (unwrap! (map-get? challenges challenge-id) ERR_CHALLENGE_NOT_FOUND))
+        (existing-participation (map-get? user-challenges {user: user, challenge-id: challenge-id}))
+    )
+        (asserts! (is-some (map-get? users user)) ERR_USER_NOT_FOUND)
+        (asserts! (get is-active challenge) ERR_CHALLENGE_INACTIVE)
+        (asserts! (< stacks-block-height (get end-block challenge)) ERR_CHALLENGE_ENDED)
+        (asserts! (< (get current-participants challenge) (get max-participants challenge)) ERR_INVALID_DATA)
+        (asserts! (is-none existing-participation) ERR_ALREADY_JOINED_CHALLENGE)
+        
+        (map-set user-challenges {user: user, challenge-id: challenge-id} {
+            joined: true,
+            current-progress: u0,
+            final-score: u0,
+            rank: none,
+            reward-claimed: false,
+            join-block: stacks-block-height
+        })
+        
+        (map-set challenges challenge-id (merge challenge {
+            current-participants: (+ (get current-participants challenge) u1)
+        }))
+        
+        (ok true)
+    )
+)
+
+(define-public (update-challenge-progress (challenge-id uint) (user principal) (progress-value uint))
+    (begin
+        (asserts! (default-to false (map-get? oracle-providers tx-sender)) ERR_ORACLE_NOT_AUTHORIZED)
+        
+        (let (
+            (challenge (unwrap! (map-get? challenges challenge-id) ERR_CHALLENGE_NOT_FOUND))
+            (user-challenge (unwrap! (map-get? user-challenges {user: user, challenge-id: challenge-id}) ERR_CHALLENGE_NOT_JOINED))
+        )
+            (asserts! (get is-active challenge) ERR_CHALLENGE_INACTIVE)
+            (asserts! (get joined user-challenge) ERR_CHALLENGE_NOT_JOINED)
+            
+            (map-set user-challenges {user: user, challenge-id: challenge-id} 
+                (merge user-challenge {
+                    current-progress: progress-value
+                }))
+            
+            (ok true)
+        )
+    )
+)
+
+(define-public (finalize-challenge (challenge-id uint))
+    (begin
+        (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_NOT_AUTHORIZED)
+        
+        (let ((challenge (unwrap! (map-get? challenges challenge-id) ERR_CHALLENGE_NOT_FOUND)))
+            (asserts! (get is-active challenge) ERR_CHALLENGE_INACTIVE)
+            (asserts! (>= stacks-block-height (get end-block challenge)) ERR_CHALLENGE_NOT_ENDED)
+            
+            (map-set challenges challenge-id (merge challenge {is-active: false}))
+            (try! (calculate-challenge-rankings challenge-id))
+            (ok true)
+        )
+    )
+)
+
+(define-public (claim-challenge-reward (challenge-id uint))
+    (let (
+        (user tx-sender)
+        (challenge (unwrap! (map-get? challenges challenge-id) ERR_CHALLENGE_NOT_FOUND))
+        (user-challenge (unwrap! (map-get? user-challenges {user: user, challenge-id: challenge-id}) ERR_CHALLENGE_NOT_JOINED))
+    )
+        (asserts! (not (get is-active challenge)) ERR_CHALLENGE_INACTIVE)
+        (asserts! (get joined user-challenge) ERR_CHALLENGE_NOT_JOINED)
+        (asserts! (not (get reward-claimed user-challenge)) ERR_ALREADY_CLAIMED)
+        (asserts! (is-some (get rank user-challenge)) ERR_GOAL_NOT_MET)
+        
+        (let (
+            (user-rank (unwrap! (get rank user-challenge) ERR_GOAL_NOT_MET))
+            (leaderboard-entry (unwrap! (map-get? challenge-leaderboard {challenge-id: challenge-id, rank: user-rank}) ERR_GOAL_NOT_MET))
+            (final-reward (/ (* (get base-reward challenge) (get reward-multiplier leaderboard-entry)) u100))
+        )
+            (map-set user-challenges {user: user, challenge-id: challenge-id}
+                (merge user-challenge {reward-claimed: true}))
+            
+            (try! (ft-mint? fitness-token final-reward user))
+            (var-set total-fitness-tokens (+ (var-get total-fitness-tokens) final-reward))
+            
+            (let ((user-data (unwrap! (map-get? users user) ERR_USER_NOT_FOUND)))
+                (map-set users user (merge user-data {
+                    total-rewards: (+ (get total-rewards user-data) final-reward)
+                }))
+            )
+            
+            (ok final-reward)
+        )
+    )
+)
+
 (define-private (update-streak (user principal))
     (let (
         (current-block stacks-block-height)
@@ -387,6 +556,38 @@
     )
 )
 
+(define-private (calculate-challenge-rankings (challenge-id uint))
+    (let (
+        (challenge (unwrap! (map-get? challenges challenge-id) ERR_CHALLENGE_NOT_FOUND))
+        (base-multiplier (get multiplier-rate challenge))
+    )
+        (begin
+            (unwrap-panic (rank-user-by-score challenge-id u1 base-multiplier))
+            (ok true)
+        )
+    )
+)
+
+(define-private (rank-user-by-score (challenge-id uint) (current-rank uint) (multiplier uint))
+    (let (
+        (max-rank u10)
+        (participation-bonus (if (<= current-rank u3) u50 (if (<= current-rank u5) u25 u10)))
+        (final-multiplier (+ multiplier participation-bonus))
+    )
+        (if (<= current-rank max-rank)
+            (begin
+                (map-set challenge-leaderboard {challenge-id: challenge-id, rank: current-rank} {
+                    user: tx-sender,
+                    score: u0,
+                    reward-multiplier: final-multiplier
+                })
+                (ok true)
+            )
+            (ok true)
+        )
+    )
+)
+
 (define-read-only (get-user-stats (user principal))
     (map-get? users user)
 )
@@ -433,4 +634,24 @@
 
 (define-read-only (get-next-milestone-id)
     (var-get next-milestone-id)
+)
+
+(define-read-only (get-challenge-details (challenge-id uint))
+    (map-get? challenges challenge-id)
+)
+
+(define-read-only (get-user-challenge-status (user principal) (challenge-id uint))
+    (map-get? user-challenges {user: user, challenge-id: challenge-id})
+)
+
+(define-read-only (get-challenge-leaderboard-entry (challenge-id uint) (rank uint))
+    (map-get? challenge-leaderboard {challenge-id: challenge-id, rank: rank})
+)
+
+(define-read-only (get-next-challenge-id)
+    (var-get next-challenge-id)
+)
+
+(define-read-only (get-active-challenges-count)
+    (var-get next-challenge-id)
 )
