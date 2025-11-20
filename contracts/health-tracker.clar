@@ -10,6 +10,7 @@
 (define-constant ERR-INSUFFICIENT-BALANCE (err u104))
 (define-constant ERR-ALREADY-EXISTS (err u105))
 (define-constant ERR-INVALID-AMOUNT (err u106))
+(define-constant ERR-ACHIEVEMENT-EXISTS (err u107))
 
 ;; Data Variables
 (define-data-var next-user-id uint u1)
@@ -41,6 +42,22 @@
 (define-map activity-types (string-ascii 20) uint)
 (define-map daily-activity principal uint)
 
+(define-map achievements (string-ascii 30) 
+  {
+    title: (string-ascii 50),
+    description: (string-ascii 100),
+    reward-bonus: uint,
+    requirement-type: (string-ascii 20),
+    requirement-value: uint
+  })
+
+(define-map user-achievements 
+  {user: principal, achievement-id: (string-ascii 30)} 
+  {earned-at: uint, claimed: bool})
+
+(define-map leaderboard-scores principal 
+  {score: uint, rank: uint})
+
 ;; Initialize activity reward rates (per minute)
 (map-set activity-types "walking" u2)
 (map-set activity-types "running" u5)
@@ -48,6 +65,12 @@
 (map-set activity-types "swimming" u6)
 (map-set activity-types "yoga" u3)
 (map-set activity-types "weightlifting" u4)
+
+(map-set achievements "first-activity" {title: "First Step", description: "Complete your first activity", reward-bonus: u100, requirement-type: "activity-count", requirement-value: u1})
+(map-set achievements "streak-7" {title: "Week Warrior", description: "Maintain a 7-day streak", reward-bonus: u500, requirement-type: "streak", requirement-value: u7})
+(map-set achievements "streak-30" {title: "Month Master", description: "Maintain a 30-day streak", reward-bonus: u2000, requirement-type: "streak", requirement-value: u30})
+(map-set achievements "activity-100" {title: "Century Club", description: "Complete 100 activities", reward-bonus: u1500, requirement-type: "activity-count", requirement-value: u100})
+(map-set achievements "rewards-10000" {title: "Reward Hunter", description: "Earn 10000 total rewards", reward-bonus: u1000, requirement-type: "total-rewards", requirement-value: u10000})
 
 ;; Public Functions
 
@@ -160,6 +183,51 @@
   )
 )
 
+(define-public (create-achievement 
+  (achievement-id (string-ascii 30)) 
+  (title (string-ascii 50)) 
+  (description (string-ascii 100)) 
+  (reward-bonus uint) 
+  (requirement-type (string-ascii 20)) 
+  (requirement-value uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT-OWNER) ERR-OWNER-ONLY)
+    (asserts! (is-none (map-get? achievements achievement-id)) ERR-ACHIEVEMENT-EXISTS)
+    (map-set achievements achievement-id {
+      title: title,
+      description: description,
+      reward-bonus: reward-bonus,
+      requirement-type: requirement-type,
+      requirement-value: requirement-value
+    })
+    (ok true)
+  )
+)
+
+(define-public (claim-achievement-bonus (achievement-id (string-ascii 30)))
+  (let 
+    (
+      (caller tx-sender)
+      (achievement-key {user: caller, achievement-id: achievement-id})
+      (user-achievement (unwrap! (map-get? user-achievements achievement-key) ERR-NOT-FOUND))
+      (achievement-data (unwrap! (map-get? achievements achievement-id) ERR-NOT-FOUND))
+      (bonus (get reward-bonus achievement-data))
+    )
+    (asserts! (not (get claimed user-achievement)) ERR-ALREADY-EXISTS)
+    (map-set user-achievements achievement-key (merge user-achievement {claimed: true}))
+    (match (map-get? users caller)
+      user-data
+      (begin
+        (map-set users caller (merge user-data {
+          total-rewards-earned: (+ (get total-rewards-earned user-data) bonus)
+        }))
+        (ok bonus)
+      )
+      ERR-NOT-FOUND
+    )
+  )
+)
+
 ;; Private Functions
 
 ;; Calculate bonus reward based on streak and consistency
@@ -196,16 +264,64 @@
             u1
           )
         )
+        (new-total-activities (+ (get total-activities user-data) u1))
+        (new-total-rewards (+ (get total-rewards-earned user-data) reward-amount))
       )
       (map-set users user (merge user-data {
-        total-activities: (+ (get total-activities user-data) u1),
-        total-rewards-earned: (+ (get total-rewards-earned user-data) reward-amount),
+        total-activities: new-total-activities,
+        total-rewards-earned: new-total-rewards,
         streak-days: new-streak,
         last-activity-date: current-date
       }))
+      (update-leaderboard-score user new-total-rewards)
+      (check-and-award-achievements user new-total-activities new-streak new-total-rewards current-date)
       true
     )
     false
+  )
+)
+
+(define-private (update-leaderboard-score (user principal) (score uint))
+  (begin
+    (map-set leaderboard-scores user {score: score, rank: u0})
+    true
+  )
+)
+
+(define-private (check-and-award-achievements (user principal) (total-activities uint) (streak uint) (total-rewards uint) (current-date uint))
+  (begin
+    (if (is-eq total-activities u1)
+      (award-achievement user "first-activity" current-date)
+      true)
+    (if (is-eq streak u7)
+      (award-achievement user "streak-7" current-date)
+      true)
+    (if (is-eq streak u30)
+      (award-achievement user "streak-30" current-date)
+      true)
+    (if (is-eq total-activities u100)
+      (award-achievement user "activity-100" current-date)
+      true)
+    (if (is-eq total-rewards u10000)
+      (award-achievement user "rewards-10000" current-date)
+      true)
+    true
+  )
+)
+
+(define-private (award-achievement (user principal) (achievement-id (string-ascii 30)) (date uint))
+  (let 
+    (
+      (achievement-key {user: user, achievement-id: achievement-id})
+      (existing (map-get? user-achievements achievement-key))
+    )
+    (if (is-none existing)
+      (begin
+        (map-set user-achievements achievement-key {earned-at: date, claimed: false})
+        true
+      )
+      true
+    )
   )
 )
 
@@ -253,4 +369,20 @@
     rate (some (* rate duration-minutes))
     none
   )
+)
+
+(define-read-only (get-achievement (achievement-id (string-ascii 30)))
+  (map-get? achievements achievement-id)
+)
+
+(define-read-only (get-user-achievement (user principal) (achievement-id (string-ascii 30)))
+  (map-get? user-achievements {user: user, achievement-id: achievement-id})
+)
+
+(define-read-only (get-leaderboard-score (user principal))
+  (map-get? leaderboard-scores user)
+)
+
+(define-read-only (has-achievement (user principal) (achievement-id (string-ascii 30)))
+  (is-some (map-get? user-achievements {user: user, achievement-id: achievement-id}))
 )
